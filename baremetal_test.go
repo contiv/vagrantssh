@@ -3,6 +3,7 @@
 package remotessh
 
 import (
+	"os"
 	"strings"
 	"sync"
 	. "testing"
@@ -90,4 +91,49 @@ func (b *baremetalTestSuite) TestIterateNodes(c *C) {
 		return node.RunCommand("exit 1")
 	}), NotNil)
 	c.Assert(i, Equals, 2)
+}
+
+func (b *baremetalTestSuite) TestScpFileFromRemoteNodes(c *C) {
+	for _, node := range b.tb.GetNodes() {
+		localFilename := "./"+node.GetName()+"_test_local"
+		remoteFilename := "test_remote_to_local"
+
+		_, err := node.RunCommandWithOutput("echo `pwd` > " + remoteFilename)
+		c.Assert(err, IsNil)
+
+		err = node.ScpFromRemoteToLocal(remoteFilename, localFilename)
+		c.Assert(err, IsNil)
+
+		// verify local file was created
+		_, err = os.Stat(localFilename)
+		c.Assert(err, IsNil)
+
+		// cleanup
+		os.Remove(localFilename)
+		node.RunCommand("rm " + remoteFilename)
+	}
+}
+
+func (b *baremetalTestSuite) TestScpFileToRemoteNodes(c *C) {
+	for _, node := range b.tb.GetNodes() {
+		localFilename := "test_local"
+		remoteFilename := "test_local_to_remote"
+
+		f, err := os.Create(localFilename)
+		_, err = f.WriteString("I am testing scp")
+
+		err = node.ScpFromLocalToRemote(localFilename, remoteFilename)
+		c.Assert(err, IsNil)
+
+		// verify scp created a file on remote node
+		out, err := node.RunCommandWithOutput("ls")
+		c.Assert(err, IsNil)
+		if !strings.Contains(out, remoteFilename) {
+			c.Errorf("Output of ls on remote node: %s", out)
+		}
+
+		// cleanup
+		os.Remove(localFilename)
+		node.RunCommand("rm " + remoteFilename)
+	}
 }
