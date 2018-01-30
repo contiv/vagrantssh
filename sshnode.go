@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -34,12 +35,14 @@ var SSHRetryDelay = time.Second
 
 // SSHNode implements a node with ssh connectivity in a testbed
 type SSHNode struct {
-	Name      string
-	env       []string
-	primaryIP net.IP
-	sshAddr   string
-	sshPort   string
-	config    *ssh.ClientConfig
+	Name        string
+	env         []string
+	primaryIP   net.IP
+	sshAddr     string
+	sshPort     string
+	config      *ssh.ClientConfig
+	client      *ssh.Client
+	clientMutex *sync.RWMutex
 }
 
 // NewSSHNode intializes a ssh-client based node in a testbed
@@ -64,8 +67,15 @@ func NewSSHNode(name, user string, env []string, sshAddr, sshPort, privKeyFile s
 			ssh.PublicKeys(signer),
 		},
 	}
+	node := &SSHNode{Name: name,
+		env:         env,
+		sshAddr:     sshAddr,
+		sshPort:     sshPort,
+		config:      config,
+		clientMutex: &sync.RWMutex{},
+	}
 
-	return &SSHNode{Name: name, env: env, sshAddr: sshAddr, sshPort: sshPort, config: config}, nil
+	return node, nil
 }
 
 func (n *SSHNode) dial() (*ssh.Client, error) {
@@ -77,8 +87,15 @@ func (n *SSHNode) dial() (*ssh.Client, error) {
 	return client, nil
 }
 
-// Cleanup does nothing
-func (n *SSHNode) Cleanup() {}
+// Cleanup closes the client if it's open
+func (n *SSHNode) Cleanup() {
+	n.clientMutex.Lock()
+	if n.client != nil {
+		n.client.Close()
+		n.client = nil
+	}
+	n.clientMutex.Unlock()
+}
 
 func newCmdStrWithSource(cmd string, env []string) string {
 	// we need to source the environment manually as the ssh package client
@@ -103,22 +120,45 @@ func newCmdStrWithSource(cmd string, env []string) string {
 	return command
 }
 
-func (n *SSHNode) getClientAndSession() (*ssh.Client, *ssh.Session, error) {
-	var client *ssh.Client
-	var s *ssh.Session
-	var err error
-
-	// Retry few times if ssh connection fails
+func (n *SSHNode) connect() error {
 	for i := 0; i < MaxSSHRetries; i++ {
-		client, err = n.dial()
+		client, err := n.dial()
 		if err != nil {
 			time.Sleep(SSHRetryDelay)
 			continue
 		}
+		n.client = client
+	}
+	if n.client == nil {
+		return fmt.Errorf("failed to connect to host")
+	}
 
-		s, err = client.NewSession()
+	return nil
+}
+
+func (n *SSHNode) getSession() (*ssh.Session, error) {
+	var s *ssh.Session
+	var err error
+
+	n.clientMutex.RLock()
+	if n.client == nil {
+		n.clientMutex.RUnlock()
+		n.clientMutex.Lock()
+		n.connect()
+		n.clientMutex.Unlock()
+	} else {
+		n.clientMutex.RUnlock()
+	}
+
+	for i := 0; i < MaxSSHRetries; i++ {
+		n.clientMutex.RLock()
+		s, err = n.client.NewSession()
+		n.clientMutex.RUnlock()
 		if err != nil {
-			client.Close()
+			n.clientMutex.Lock()
+			n.client.Close()
+			n.connect()
+			n.clientMutex.Unlock()
 			time.Sleep(SSHRetryDelay)
 			continue
 		}
@@ -129,23 +169,22 @@ func (n *SSHNode) getClientAndSession() (*ssh.Client, *ssh.Session, error) {
 		}
 		// Request pseudo terminal
 		if err := s.RequestPty("xterm", 40, 80, modes); err != nil {
-			return nil, nil, fmt.Errorf("failed to get pseudo-terminal: %v", err)
+			return nil, fmt.Errorf("failed to get pseudo-terminal: %v", err)
 		}
 
-		return client, s, nil
+		return s, nil
 	}
 
-	return nil, nil, err
+	return nil, err
 }
 
 // RunCommand runs a shell command in a vagrant node and returns it's exit status
 func (n *SSHNode) RunCommand(cmd string) error {
-	client, s, err := n.getClientAndSession()
+	s, err := n.getSession()
 	if err != nil {
 		return err
 	}
 
-	defer client.Close()
 	defer s.Close()
 
 	return s.Run(newCmdStrWithSource(cmd, n.env))
@@ -154,12 +193,11 @@ func (n *SSHNode) RunCommand(cmd string) error {
 // RunCommandWithOutput runs a shell command in a vagrant node and returns it's
 // exit status and output
 func (n *SSHNode) RunCommandWithOutput(cmd string) (string, error) {
-	client, s, err := n.getClientAndSession()
+	s, err := n.getSession()
 	if err != nil {
 		return "", err
 	}
 
-	defer client.Close()
 	defer s.Close()
 
 	output, err := s.CombinedOutput(newCmdStrWithSource(cmd, n.env))
@@ -171,7 +209,7 @@ func (n *SSHNode) RunCommandBackground(cmd string) error {
 	// XXX we leak a connection here so we can keep the session alive. While this
 	// is less than ideal it allows us to "fire and forget" from our perspective,
 	// and give system tests the ability to manage the background processes themselves.
-	_, s, err := n.getClientAndSession()
+	s, err := n.getSession()
 	if err != nil {
 		return err
 	}
